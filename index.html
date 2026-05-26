@@ -1,0 +1,78 @@
+const { createClient } = require('@supabase/supabase-js');
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+// توزيع round-robin بين فتاة 1 وفتاة 2
+async function distributeOrder(shopifyOrder) {
+  // عد الطلبات الحالية لكل فتاة
+  const { data: counts } = await supabase
+    .from('orders')
+    .select('agent_id')
+    .in('agent_id', ['agent1', 'agent2']);
+
+  const c1 = (counts || []).filter(r => r.agent_id === 'agent1').length;
+  const c2 = (counts || []).filter(r => r.agent_id === 'agent2').length;
+  return c1 <= c2 ? 'agent1' : 'agent2';
+}
+
+module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    // جلب الطلبات من Shopify
+    const shopifyRes = await fetch(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-01/orders.json?status=any&limit=50`,
+      { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN } }
+    );
+    const shopifyData = await shopifyRes.json();
+    const shopifyOrders = shopifyData.orders || [];
+
+    // جلب الطلبات الموجودة لتجنب التكرار
+    const { data: existing } = await supabase
+      .from('orders')
+      .select('shopify_id')
+      .not('shopify_id', 'is', null);
+
+    const existingIds = new Set((existing || []).map(r => r.shopify_id));
+    const newOrders = shopifyOrders.filter(o => !existingIds.has(String(o.id)));
+
+    // توزيع وحفظ الطلبات الجديدة
+    const toInsert = [];
+    for (const o of newOrders) {
+      const agentId = await distributeOrder(o);
+      toInsert.push({
+        id: '#' + o.order_number,
+        shopify_id: String(o.id),
+        name: o.billing_address?.name || o.email || 'غير معروف',
+        phone: (o.billing_address?.phone || o.phone || '').replace(/-/g, ''),
+        products: o.line_items.map(i => i.title + (i.quantity > 1 ? ' × ' + i.quantity : '')).join(', '),
+        qty: o.line_items.reduce((s, i) => s + i.quantity, 0),
+        price: o.total_price + ' ' + (o.currency || 'DH'),
+        city: o.shipping_address?.city || '',
+        address: o.shipping_address?.address1 || '',
+        source: 'shopify',
+        status: 'new',
+        agent_id: agentId,
+        confirmed_by: '',
+        order_date: o.created_at
+      });
+    }
+
+    if (toInsert.length > 0) {
+      await supabase.from('orders').insert(toInsert);
+    }
+
+    res.json({ synced: toInsert.length, total: shopifyOrders.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
